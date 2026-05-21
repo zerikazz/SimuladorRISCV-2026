@@ -1,6 +1,6 @@
 # SimuladorRISC-V
 
-Simulador da arquitetura RISC-V matéria de Organização de Computadores.
+Simulador da arquitetura RISC-V matéria de Arquitetura De Computadores.
 
 ![C](https://img.shields.io/badge/C-00599C?style=for-the-badge&logo=c&logoColor=white)
 ![C++](https://img.shields.io/badge/C++-00599C?style=for-the-badge&logo=cplusplus&logoColor=white)
