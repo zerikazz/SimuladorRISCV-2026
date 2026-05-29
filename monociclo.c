@@ -547,7 +547,7 @@ void carregar_programa_completo(Barramento* barramento) {
     Barramento_escrever(barramento, addr, 0x00E6A823); /* SW x14, 16(x13) - escreve ' ' */
     addr += 4;
 
-    /* escrecer resultado na vram */
+    /* escrever resultado na vram */
     /* x15 = resultado (cópia de x11) */
     Barramento_escrever(barramento, addr, 0x00058793); /* ADDI x15, x11, 0 */
     addr += 4;
