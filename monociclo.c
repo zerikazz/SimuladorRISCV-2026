@@ -202,6 +202,16 @@ bool DispositivoES_eh_endereco_vram(DispositivoES* self, uint32_t endereco) {
     return (endereco >= VRAM_INICIO && endereco <= VRAM_FIM);
 }
 
+/* ===== Temporização ===== */
+typedef struct {
+    uint32_t pc_clk_q, mem_instrucao, banco_regs, mux, ula, mem_dados, mux_final, setup_wb;
+} LatenciasReferencia;
+
+static const LatenciasReferencia LATENCIAS_PADRAO = {
+    .pc_clk_q = 30, .mem_instrucao = 250, .banco_regs = 150,
+    .mux = 25, .ula = 200, .mem_dados = 250, .mux_final = 25, .setup_wb = 20
+};
+
 /* ===== CPU ===== */
 
 typedef struct {
@@ -209,6 +219,7 @@ typedef struct {
     uint32_t pc;
     Barramento* barramento;
     uint32_t contador_instrucoes;
+    double tempo_total_ps; /* NOVO */
 } CPU;
 
 void CPU_init(CPU* self, Barramento* bus) {
@@ -217,6 +228,7 @@ void CPU_init(CPU* self, Barramento* bus) {
     self->barramento          = bus;
     self->contador_instrucoes = 0;
     self->regs[0] = 0;
+    self->tempo_total_ps = 0.0; 
 }
 
 void CPU_executar(CPU* self, uint32_t inst) {
@@ -456,6 +468,30 @@ void CPU_executar(CPU* self, uint32_t inst) {
     self->pc += 4;
 }
 
+void CPU_contabilizar_tempo(CPU* self, uint32_t inst) {
+    uint32_t opcode = inst & 0x7F;
+    uint32_t t = LATENCIAS_PADRAO.pc_clk_q + LATENCIAS_PADRAO.mem_instrucao + LATENCIAS_PADRAO.banco_regs;
+
+    switch (opcode) {
+        case 0x33: case 0x13:
+            t += LATENCIAS_PADRAO.mux + LATENCIAS_PADRAO.ula + LATENCIAS_PADRAO.mux_final + LATENCIAS_PADRAO.setup_wb;
+            break;
+        case 0x03:
+            t += LATENCIAS_PADRAO.mux + LATENCIAS_PADRAO.ula + LATENCIAS_PADRAO.mem_dados + LATENCIAS_PADRAO.mux_final + LATENCIAS_PADRAO.setup_wb;
+            break;
+        case 0x23:
+            t += LATENCIAS_PADRAO.mux + LATENCIAS_PADRAO.ula + LATENCIAS_PADRAO.mem_dados;
+            break;
+        case 0x63:
+            t += LATENCIAS_PADRAO.mux + LATENCIAS_PADRAO.ula;
+            break;
+        case 0x6F: case 0x37: case 0x17:
+            t += LATENCIAS_PADRAO.ula + LATENCIAS_PADRAO.mux_final + LATENCIAS_PADRAO.setup_wb;
+            break;
+    }
+    self->tempo_total_ps += (double)t;
+}
+
 void carregar_programa_completo(Barramento* barramento) {
     printf("\n========== CARREGANDO PROGRAMA DE TESTE COMPLETO ==========\n");
     printf("Programa: Cálculo de Fatorial e operações diversas\n");
@@ -650,7 +686,7 @@ int main(){
     /* Loop de execução */
     bool executando = true;
     int instrucoes_executadas = 0;
-    int ciclos_clock = 0; /* === NOVO CONTADOR DE CICLOS AQUI === */
+    int ciclos_clock = 0; 
 
     while (executando && instrucoes_executadas < MAX_INSTRUCOES) {
         uint32_t instr = Barramento_ler(&barramento, cpu.pc);
@@ -666,6 +702,7 @@ int main(){
         printf("PC: 0x%08X", cpu.pc);
         printf(" | Opcode: 0x%08X\n", instr);
 
+        CPU_contabilizar_tempo(&cpu, instr);  
         CPU_executar(&cpu, instr);
         instrucoes_executadas++;
         ciclos_clock++; /* === INCREMENTA O CLOCK A CADA INSTRUÇÃO === */
@@ -708,8 +745,18 @@ int main(){
     printf("\nPC final: 0x%08X\n", cpu.pc);
 
     /* === Totais de instruções e ciclos de clock === */
-    printf("Total de ciclos de clock gastos: %d\n", ciclos_clock);
-    printf("Total de instruções concluídas: %d\n", instrucoes_executadas);
+    double tempo_clock_monociclo = (double)ciclos_clock * 950.0;
+    double tempo_ocioso          = tempo_clock_monociclo - cpu.tempo_total_ps;
+
+    printf("Total de ciclos de clock gastos:  %d\n", ciclos_clock);
+    printf("Tempo por ciclo de clock:         950 ps (fixo - caminho crítico LW)\n");
+    printf("Total de instruções concluídas:   %d\n", instrucoes_executadas);
+    printf("Tempo total ativo simulado:       %.0f ps (%.3f ns)\n",
+           cpu.tempo_total_ps, cpu.tempo_total_ps / 1000.0);
+    printf("Tempo total do clock (monociclo): %.0f ps (%.3f ns)\n",
+           tempo_clock_monociclo, tempo_clock_monociclo / 1000.0);
+    printf("Tempo ocioso (overhead):          %.0f ps (instruções mais rápidas esperando o clock)\n",
+           tempo_ocioso);
     printf("====================================================\n\n");
 
     /* Estatísticas */
