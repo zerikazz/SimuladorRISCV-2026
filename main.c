@@ -193,6 +193,29 @@ bool DispositivoES_eh_endereco_vram(DispositivoES* self, uint32_t endereco) {
     return (endereco >= VRAM_INICIO && endereco <= VRAM_FIM);
 }
 
+/* ===== Temporização ===== */
+typedef struct {
+    uint32_t pc_clk_q;
+    uint32_t mem_instrucao;
+    uint32_t banco_regs;
+    uint32_t mux;
+    uint32_t ula;
+    uint32_t mem_dados;
+    uint32_t mux_final;
+    uint32_t setup_wb;
+} LatenciasReferencia;
+
+static const LatenciasReferencia LATENCIAS_PADRAO = {
+    .pc_clk_q      = 30,
+    .mem_instrucao = 250,
+    .banco_regs    = 150,
+    .mux           = 25,
+    .ula           = 200,
+    .mem_dados     = 250,
+    .mux_final     = 25,
+    .setup_wb      = 20
+};
+
 /* ===== REGISTRADORES DE PIPELINE ===== */
 
 typedef struct {
@@ -203,6 +226,7 @@ typedef struct {
 
 typedef struct {
     uint32_t pc;
+    uint32_t instrucao;
     uint32_t opcode;
     uint32_t funct3;
     uint32_t funct7;
@@ -223,6 +247,7 @@ typedef struct {
 
 typedef struct {
     uint32_t rd;
+    uint32_t instrucao;
     int32_t  resultado_ula;
     int32_t  dado_escrita;   /* dado de rs2 para SW */
     uint32_t endereco;
@@ -235,6 +260,7 @@ typedef struct {
 
 typedef struct {
     uint32_t rd;
+    uint32_t instrucao;
     int32_t  dado_final;
     bool escrever_reg;
     bool valido;
@@ -253,6 +279,8 @@ typedef struct {
     Reg_Decodificacao_Execucao reg_de;
     Reg_Execucao_Memoria       reg_em;
     Reg_Memoria_Retorno        reg_mr;
+
+    double tempo_total_ps; /* Variável de contabilização do trabalho físico */
 } CPU;
 
 void CPU_init(CPU* self, Barramento* bus) {
@@ -265,7 +293,8 @@ void CPU_init(CPU* self, Barramento* bus) {
     memset(&self->reg_de, 0, sizeof(self->reg_de));
     memset(&self->reg_em, 0, sizeof(self->reg_em));
     memset(&self->reg_mr, 0, sizeof(self->reg_mr));
-    self->regs[0] = 0;
+    self->regs[0]        = 0;
+    self->tempo_total_ps = 0.0;
 }
 
 void CPU_buscar(CPU* self) {
@@ -289,7 +318,8 @@ void CPU_decodificar(CPU* self) {
         self->parada_detectada = true;
     }
 
-    self->reg_de.pc     = self->reg_bd.pc;
+    self->reg_de.pc        = self->reg_bd.pc;
+    self->reg_de.instrucao = inst;
     self->reg_de.opcode = inst & 0x7F;
     self->reg_de.funct3 = get_bits(inst, 14, 12);
     self->reg_de.funct7 = get_bits(inst, 31, 25);
@@ -383,6 +413,7 @@ void CPU_executar_ula(CPU* self) {
     self->reg_em.ler_mem      = self->reg_de.ler_mem;
     self->reg_em.escrever_mem = self->reg_de.escrever_mem;
     self->reg_em.resultado_ula = 0;
+    self->reg_em.instrucao    = self->reg_de.instrucao;
     self->reg_em.valido = true;
 
     uint32_t opcode = self->reg_de.opcode;
@@ -545,6 +576,7 @@ void CPU_acessar_memoria(CPU* self) {
 
     self->reg_mr.rd           = self->reg_em.rd;
     self->reg_mr.escrever_reg = self->reg_em.escrever_reg;
+    self->reg_mr.instrucao    = self->reg_em.instrucao;
     self->reg_mr.valido       = true;
 
     if (self->reg_em.ler_mem) {
@@ -570,6 +602,40 @@ void CPU_escrever_retorno(CPU* self) {
     }
     self->regs[0] = 0;
     self->contador_instrucoes++; /* Apenas incrementa quando a instrução termina o pipeline */
+}
+
+void CPU_contabilizar_tempo(CPU* self, uint32_t inst) {
+    uint32_t opcode = inst & 0x7F;
+
+    /* Tempo base para todas as instruções (Fetch + Decode) */
+    uint32_t t = LATENCIAS_PADRAO.pc_clk_q +
+                 LATENCIAS_PADRAO.mem_instrucao +
+                 LATENCIAS_PADRAO.banco_regs;
+
+    switch (opcode) {
+        case 0x33: case 0x13: /* ALU R-type e I-type */
+            t += LATENCIAS_PADRAO.mux + LATENCIAS_PADRAO.ula +
+                 LATENCIAS_PADRAO.mux_final + LATENCIAS_PADRAO.setup_wb;
+            break;
+        case 0x03: /* LOAD */
+            t += LATENCIAS_PADRAO.mux + LATENCIAS_PADRAO.ula +
+                 LATENCIAS_PADRAO.mem_dados + LATENCIAS_PADRAO.mux_final +
+                 LATENCIAS_PADRAO.setup_wb;
+            break;
+        case 0x23: /* STORE */
+            t += LATENCIAS_PADRAO.mux + LATENCIAS_PADRAO.ula +
+                 LATENCIAS_PADRAO.mem_dados;
+            break;
+        case 0x63: /* BRANCH */
+            t += LATENCIAS_PADRAO.mux + LATENCIAS_PADRAO.ula;
+            break;
+        case 0x6F: case 0x37: case 0x17: /* JUMPS, LUI, AUIPC */
+            t += LATENCIAS_PADRAO.ula + LATENCIAS_PADRAO.mux_final +
+                 LATENCIAS_PADRAO.setup_wb;
+            break;
+    }
+
+    self->tempo_total_ps += (double)t;
 }
 
 void carregar_programa_completo(Barramento* barramento) {
@@ -639,8 +705,8 @@ void carregar_programa_completo(Barramento* barramento) {
     Barramento_escrever(barramento, addr, 0x02000713); addr += 4; /* ADDI x14, x0, 0x20 */
     Barramento_escrever(barramento, addr, 0x00E6A823); addr += 4; /* SW x14, 16(x13) - escreve ' ' */
 
-    /* escrecer resultado na vram */
-    /* x15 = resultado (cópia de x11) */
+    /* escrever resultado na vram */
+    /* x15 = resultado */
     Barramento_escrever(barramento, addr, 0x00058793); addr += 4; /* ADDI x15, x11, 0 */
 
     /* Escrever '1' (0x31) */
@@ -728,6 +794,11 @@ int main(){
 
         /* Chamada das fases na ordem inversa para simular paralelismo */
         CPU_escrever_retorno(&cpu);
+
+        if (cpu.reg_mr.valido && cpu.reg_mr.instrucao != 0x00000000) {
+            CPU_contabilizar_tempo(&cpu, cpu.reg_mr.instrucao);
+        }
+
         CPU_acessar_memoria(&cpu);
         CPU_executar_ula(&cpu);
         CPU_decodificar(&cpu);
@@ -777,6 +848,13 @@ int main(){
 
     printf("\nPC final: 0x%08X\n", cpu.pc);
 
+    /* O relógio do Pipeline é ditado pelo gargalo (Estágio de Memória) + Overhead */
+    double periodo_clock_pipeline = (double)(LATENCIAS_PADRAO.pc_clk_q +
+                                             LATENCIAS_PADRAO.mem_instrucao +
+                                             LATENCIAS_PADRAO.setup_wb);
+
+    double tempo_clock_pipeline = (double)instrucoes_executadas * periodo_clock_pipeline;
+
     /* Agora exibe os totais corretos separados */
     printf("Total de ciclos de clock gastos: %d\n", instrucoes_executadas);
     printf("Total de instruções concluídas: %u\n", cpu.contador_instrucoes);
@@ -784,6 +862,10 @@ int main(){
 
     /* Estatísticas */
     printf("================ ESTATÍSTICAS DO SISTEMA ================\n");
+    printf("Tempo por ciclo de clock (Tc):   %.0f ps (Gargalo Memória)\n", periodo_clock_pipeline);
+    printf("Trabalho Físico (Serial):        %.0f ps (%.3f ns)\n", cpu.tempo_total_ps, cpu.tempo_total_ps / 1000.0);
+    printf("Tempo Real Simulado (Pipeline):  %.0f ps (%.3f ns)\n", tempo_clock_pipeline, tempo_clock_pipeline / 1000.0);
+    printf("---------------------------------------------------------\n");
     printf("Operações de memória realizadas via barramento\n");
     printf("VRAM utilizada para saída de caracteres ASCII\n");
     printf("E/S programada com polling a cada %d instruções\n", INSTRUCOES_POR_ES);
